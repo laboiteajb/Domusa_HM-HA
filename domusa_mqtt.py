@@ -18,6 +18,7 @@ import signal
 import logging
 import logging.handlers
 import threading
+import statistics
 
 try:
     import RPi.GPIO as GPIO
@@ -52,7 +53,7 @@ SERIAL_BAUD    = 9600
 MQTT_BROKER    = "192.168.0.251"
 MQTT_PORT      = 1883
 MQTT_USER      = "mqtt"
-MQTT_PASSWORD  = "CHANGE_ME"
+MQTT_PASSWORD  = os.environ.get("MQTT_PASSWORD", "")   # défini dans /etc/default/domusa-mqtt (hors dépôt)
 MQTT_CLIENT_ID = "domusa_boiler"
 MQTT_BASE      = "domusa"
 
@@ -60,7 +61,35 @@ HA_PREFIX      = "homeassistant"          # préfixe de découverte HA
 HA_STATUS      = f"{HA_PREFIX}/status"    # topic du message de naissance/testament HA
 AVAIL_TOPIC    = f"{MQTT_BASE}/state"     # online / offline
 
-PUBLISH_INTERVAL = 5.0   # secondes entre publications complètes (même sans changement)
+# ── PARAMÈTRES MODIFIABLES SANS TOUCHER AU CODE ───────────────────────────────
+# Fichier : /etc/default/domusa-mqtt  (une ligne NOM=valeur), puis : sudo systemctl restart domusa-mqtt
+#   DOMUSA_LOG=quiet|changes|verbose   quiet = avertissements + 1 ligne de statut / 10 min
+#                                      changes = + changements de phase/erreur (défaut)
+#                                      verbose = tout, comme avant (beaucoup d'écritures sur la carte SD)
+#   DOMUSA_STATUS_LOG_S=600            période de la ligne de statut (modes quiet/changes)
+#   DOMUSA_BUS_STALE_S=60              sans trame Modbus depuis X s => entités chaudière "indisponibles"
+#   DOMUSA_SENSOR_STALE_S=60           sans mesure valide depuis X s => capteur GPIO "indisponible"
+#   DOMUSA_DIST_SAMPLES=5              mesures par cycle, la médiane est publiée
+#   DOMUSA_DIST_MAX_CM=400             mesure au-delà = rejetée
+#   DOMUSA_DIST_JUMP_CM=30             saut plus grand = confirmé par une 2e mesure cohérente
+#   DOMUSA_CAPTURE=0|1                 1 = enregistre chaque changement de registre (reverse engineering)
+def _env(name, default, cast=str):
+    try:
+        return cast(os.environ.get(name, default))
+    except ValueError:
+        return cast(default)
+
+LOG_MODE         = _env("DOMUSA_LOG", "changes")
+STATUS_LOG_S     = _env("DOMUSA_STATUS_LOG_S", "600", int)
+BUS_STALE_S      = _env("DOMUSA_BUS_STALE_S", "60", int)
+SENSOR_STALE_S   = _env("DOMUSA_SENSOR_STALE_S", "60", int)
+DIST_SAMPLES     = _env("DOMUSA_DIST_SAMPLES", "5", int)
+DIST_MAX_CM      = _env("DOMUSA_DIST_MAX_CM", "400", float)
+DIST_JUMP_CM     = _env("DOMUSA_DIST_JUMP_CM", "30", float)
+CAPTURE          = _env("DOMUSA_CAPTURE", "0") == "1"
+CAPTURE_DIR      = "/var/lib/domusa"
+CAPTURE_X_MAX    = _env("DOMUSA_CAPTURE_X_MAX", "5000000", int)   # octets/jour max pour les trames ignorées (lignes X)
+CAPTURE_KEEP_DAYS = 21
 
 # ── CONFIGURATION GPIO (RPi 3) ────────────────────────────────────────────────
 # Broches physiques converties en BCM pour RPi.GPIO
@@ -122,11 +151,40 @@ DEVICE = {
     "sw_version": "1.0",
 }
 
-AVAILABILITY = [{
-    "topic": AVAIL_TOPIC,
-    "payload_available": "online",
-    "payload_not_available": "offline",
-}]
+AVAIL_BUS_TOPIC = f"{MQTT_BASE}/bus"    # online tant que des trames Modbus fraîches arrivent
+_AV = {"payload_available": "online", "payload_not_available": "offline"}
+AVAILABILITY_BUS = [{"topic": AVAIL_TOPIC, **_AV}, {"topic": AVAIL_BUS_TOPIC, **_AV}]
+AVAILABILITY_BRIDGE = [{"topic": AVAIL_TOPIC, **_AV}]
+
+# Capteurs GPIO disposant de leur propre disponibilité (mesure fraîche) : uid -> topic
+GPIO_AVAIL = {
+    "pellets_dist_1": f"{MQTT_BASE}/avail/pellets_dist_1",
+    "pellets_dist_2": f"{MQTT_BASE}/avail/pellets_dist_2",
+    "temp_esc_gpio":  f"{MQTT_BASE}/avail/temp_esc_gpio",
+}
+GPIO_DIGITAL = {"prox_pellet", "alarme_externe"}   # toujours lisibles : disponibilité du pont seule
+
+_avail_state = {}
+def set_avail(client, topic, online):
+    """Publie online/offline seulement sur changement. Retourne True si changé."""
+    val = "online" if online else "offline"
+    if _avail_state.get(topic) == val:
+        return False
+    _avail_state[topic] = val
+    client.publish(topic, val, qos=1, retain=True)
+    return True
+
+def avail_for(uid):
+    if uid in GPIO_AVAIL:
+        return [{"topic": AVAIL_TOPIC, **_AV}, {"topic": GPIO_AVAIL[uid], **_AV}]
+    if uid in GPIO_DIGITAL:
+        return AVAILABILITY_BRIDGE
+    return AVAILABILITY_BUS
+
+# Journal : verbose = tout ; sinon seulement changements / statut / avertissements
+def vlog(msg, *args):
+    if LOG_MODE == "verbose":
+        log.info(msg, *args)
 
 # ── Registres Modbus ──────────────────────────────────────────────────────────
 REGISTER_NAMES = {
@@ -446,7 +504,9 @@ def build_payload(regs: list) -> dict:
     payload["phase_label_fr"] = PHASE_LABELS_FR.get(phase_code, f"Inconnu ({phase_code})")
     
     # Traduction Code Erreur
-    err_code = regs[22]
+    # R22 reste à 0 sur certains défauts (ex. E12 affiché, R18=12) : on prend R18 à défaut
+    err_code = regs[22] or regs[18]
+    payload["code_erreur"] = err_code
     payload["code_erreur_fr"] = ERROR_CODES_FR.get(err_code, f"Inconnu ({err_code})")
     
     # Décomposition complète R32 (tous les bits documentés)
@@ -469,21 +529,21 @@ def get_distance(trig, echo, label="?"):
     time.sleep(0.00001)
     GPIO.output(trig, False)
 
-    start_time = time.time()
-    stop_time  = time.time()
+    start_time = time.perf_counter()
+    stop_time  = time.perf_counter()
     
     # Attente du début de l'Echo (front montant)
-    timeout_start = time.time()
+    timeout_start = time.perf_counter()
     while GPIO.input(echo) == 0:
-        start_time = time.time()
+        start_time = time.perf_counter()
         if start_time - timeout_start > 0.05:
             # log.debug(f"US {label} | Timeout: pas de début d'Echo reçu")
             return -1
 
     # Attente de la fin de l'Echo (front descendant)
-    timeout_stop = time.time()
+    timeout_stop = time.perf_counter()
     while GPIO.input(echo) == 1:
-        stop_time = time.time()
+        stop_time = time.perf_counter()
         if stop_time - timeout_stop > 0.05:
             # log.debug(f"US {label} | Timeout: l'Echo reste à l'état haut")
             return -2
@@ -510,6 +570,40 @@ def get_ds18b20_temp():
         pass
     return -99
 
+def measure_median(trig, echo):
+    """Médiane de DIST_SAMPLES mesures valides ; None s'il y en a trop peu (capteur muet ou bruyant)."""
+    vals = []
+    for _ in range(max(1, DIST_SAMPLES)):
+        d = get_distance(trig, echo)
+        if 2.0 <= d <= DIST_MAX_CM:
+            vals.append(d)
+        time.sleep(0.06)
+    if len(vals) < max(1, DIST_SAMPLES // 2 + 1):
+        return None
+    return round(statistics.median(vals), 1)
+
+def accept_distance(state, new):
+    """Rejette un saut brutal tant qu'une 2e mesure cohérente ne le confirme pas."""
+    last = state.get("last")
+    if last is None or abs(new - last) <= DIST_JUMP_CM:
+        state["last"], state["pending"] = new, None
+        return new
+    pend = state.get("pending")
+    if pend is not None and abs(new - pend) <= DIST_JUMP_CM / 2:
+        state["last"], state["pending"] = new, None
+        return new
+    state["pending"] = new
+    return None
+
+def check_stale(client, name, topic, st, now):
+    """Marque le capteur indisponible / disponible selon la fraîcheur de sa dernière mesure valide."""
+    fresh = (now - st["ok_at"]) <= SENSOR_STALE_S
+    if set_avail(client, topic, fresh):
+        if fresh:
+            log.info("GPIO | %s : mesures valides de nouveau", name)
+        else:
+            log.warning("GPIO | %s : aucune mesure valide depuis %d s -> indisponible", name, SENSOR_STALE_S)
+
 # Global pour stocker les dernières valeurs GPIO
 gpio_data = {
     "dist1": -1, "dist2": -1, "temp_esc": -99, "prox": False, "alarm": False
@@ -519,48 +613,58 @@ def periodic_gpio_reader(client, running_flag):
     """Thread de lecture périodique des GPIO (évite de bloquer le Modbus)."""
     log.info("Thread GPIO démarré.")
     first_log = True
+    dist_state = {}
+    last_prox = last_alarm = None
     while running_flag():
         try:
-            # 1. Distances (HC-SR04)
-            if ENABLE_PELLET_DIST_1:
-                d1 = get_distance(PIN_DIST1_TRIG, PIN_DIST1_ECHO, "1")
-                if d1 > 0:
-                    client.publish(f"{MQTT_BASE}/sensor/pellets_dist_1", str(d1))
-                    log.info(f"GPIO | Dist 1 : {d1} cm")
-                elif d1 == -2:
-                    log.warning("GPIO | Dist 1 ERROR -2: Echo bloqué à HAUT (vérifiez câblage/résistances)")
-                elif d1 < 0:
-                    log.warning(f"GPIO | Dist 1 ERROR: {d1}")
+            now = time.time()
+            # 1. Distances (HC-SR04) : médiane + rejet des sauts non confirmés
+            for flag, name, trig, echo, key in (
+                (ENABLE_PELLET_DIST_1, "Dist 1", PIN_DIST1_TRIG, PIN_DIST1_ECHO, "pellets_dist_1"),
+                (ENABLE_PELLET_DIST_2, "Dist 2", PIN_DIST2_TRIG, PIN_DIST2_ECHO, "pellets_dist_2"),
+            ):
+                if not flag:
+                    continue
+                st = dist_state.setdefault(key, {"ok_at": time.time()})
+                raw = measure_median(trig, echo)
+                if raw is not None:
+                    v = accept_distance(st, raw)
+                    if v is not None:
+                        st["ok_at"] = now
+                        client.publish(f"{MQTT_BASE}/sensor/{key}", str(v), qos=0, retain=True)
+                        vlog("GPIO | %s : %s cm", name, v)
+                        capture.gpio(key, v)
+                check_stale(client, name, GPIO_AVAIL[key], st, time.time())
 
-            if ENABLE_PELLET_DIST_2:
-                d2 = get_distance(PIN_DIST2_TRIG, PIN_DIST2_ECHO, "2")
-                if d2 > 0:
-                    client.publish(f"{MQTT_BASE}/sensor/pellets_dist_2", str(d2))
-                    log.info(f"GPIO | Dist 2 : {d2} cm")
-                elif d2 == -2:
-                    log.warning("GPIO | Dist 2 ERROR -2: Echo bloqué à HAUT (vérifiez câblage/résistances)")
-                elif d2 < 0:
-                    log.warning(f"GPIO | Dist 2 ERROR: {d2}")
-            
             # 2. Température DS18B20
             if ENABLE_TEMP_ESC:
+                st = dist_state.setdefault("temp_esc_gpio", {"ok_at": time.time()})
                 t_esc = get_ds18b20_temp()
                 if t_esc != -99:
-                    client.publish(f"{MQTT_BASE}/sensor/temp_esc_gpio", str(t_esc))
-                    log.info(f"GPIO | Temp ESC : {t_esc}°C")
-            
+                    st["ok_at"] = now
+                    client.publish(f"{MQTT_BASE}/sensor/temp_esc_gpio", str(t_esc), qos=0, retain=True)
+                    vlog("GPIO | Temp ESC : %s°C", t_esc)
+                    capture.gpio("temp_esc_gpio", t_esc)
+                check_stale(client, "Temp ESC", GPIO_AVAIL["temp_esc_gpio"], st, time.time())
+
             # 3. Digital (TCRT5000 et Alarme)
             # Logique inversée pour TCRT5000 (0 = Libre, 1 = Détecté ?)
             if ENABLE_PROX_PELLET:
                 prox = GPIO.input(PIN_PROX_PELLET) 
-                client.publish(f"{MQTT_BASE}/binary/prox_pellet", "OFF" if prox else "ON")
+                client.publish(f"{MQTT_BASE}/binary/prox_pellet", "OFF" if prox else "ON", retain=True)
+                if prox != last_prox:
+                    capture.gpio("prox_pellet", int(bool(prox)))
+                    last_prox = prox
                 if first_log:
                     log.info(f"GPIO INITIAL | Prox: {'DÉTECTÉ' if prox else 'Libre'}")
 
             # Alarme : supposé normalement ouvert (tiré à la masse si actif)
             if ENABLE_ALARM_IN:
                 alarm = not GPIO.input(PIN_ALARM_IN)
-                client.publish(f"{MQTT_BASE}/binary/alarme_externe", "ON" if alarm else "OFF")
+                client.publish(f"{MQTT_BASE}/binary/alarme_externe", "ON" if alarm else "OFF", retain=True)
+                if alarm != last_alarm:
+                    capture.gpio("alarme_externe", int(bool(alarm)))
+                    last_alarm = alarm
                 if first_log:
                     log.info(f"GPIO INITIAL | Alarme: {'ALERTE' if alarm else 'OK'}")
 
@@ -596,7 +700,8 @@ def publish_discovery(client: mqtt.Client) -> None:
             "name": name,
             "unique_id": f"domusa_{uid}",
             "state_topic": state_topic,
-            "availability": AVAILABILITY,
+            "availability": avail_for(uid),
+            "availability_mode": "all",
             "device": DEVICE,
             **extra,
         }
@@ -617,7 +722,8 @@ def publish_discovery(client: mqtt.Client) -> None:
             "state_topic": state_topic,
             "payload_on": "ON",
             "payload_off": "OFF",
-            "availability": AVAILABILITY,
+            "availability": avail_for(uid),
+            "availability_mode": "all",
             "device": DEVICE,
             **extra,
         }
@@ -651,7 +757,7 @@ def publish_all(client: mqtt.Client, regs: list) -> None:
     client.publish(f"{MQTT_BASE}/sensor/phase_label",    payload["phase_label"],    qos=0, retain=True)
     client.publish(f"{MQTT_BASE}/sensor/phase_label_fr", payload["phase_label_fr"], qos=0, retain=True)
     client.publish(f"{MQTT_BASE}/sensor/code_erreur_fr", payload["code_erreur_fr"], qos=0, retain=True)
-    client.publish(f"{MQTT_BASE}/sensor/code_erreur",    str(regs[22]),             qos=0, retain=True)
+    client.publish(f"{MQTT_BASE}/sensor/code_erreur",    str(payload["code_erreur"]), qos=0, retain=True)
     client.publish(f"{MQTT_BASE}/sensor/demande_chaleur", str(regs[37]),            qos=0, retain=True)
     client.publish(f"{MQTT_BASE}/sensor/registre_r49", str(regs[49]),           qos=0, retain=True)
 
@@ -673,26 +779,142 @@ def publish_all(client: mqtt.Client, regs: list) -> None:
     for i, val in enumerate(regs):
         client.publish(f"{MQTT_BASE}/raw/R{i:02d}", str(val), qos=0, retain=True)
 
-    log.info(
-        "MQTT | Phase=%-20s T°=%.1f°C Cons=%.1f°C "
-        "Press=%.2fbar Venti=%d%% Flamme=%d%% RPM=%d Err=%d",
-        payload["phase_label"],
-        payload["temp_chaudiere"],
-        payload["consigne_chaudiere"],
-        payload["pression_eau"],
-        payload["ventilateur_pct"],
-        payload["capteur_flamme"],
-        payload["rpm_extracteur"],
-        payload["code_erreur"],
-    )
+    log_status(payload)
+
+
+_status = {"phase": None, "err": None, "at": 0.0}
+
+def log_status(payload):
+    """Journal selon DOMUSA_LOG : verbose = chaque trame ; sinon changements + statut périodique."""
+    line = ("MQTT | Phase=%-20s T°=%.1f°C Cons=%.1f°C Press=%.2fbar Venti=%d%% Flamme=%d%% RPM=%d Err=%d" % (
+        payload["phase_label"], payload["temp_chaudiere"], payload["consigne_chaudiere"],
+        payload["pression_eau"], payload["ventilateur_pct"], payload["capteur_flamme"],
+        payload["rpm_extracteur"], payload["code_erreur"]))
+    now = time.time()
+    if LOG_MODE == "verbose":
+        log.info(line)
+        return
+    changed = False
+    if payload["phase_label"] != _status["phase"]:
+        if payload["phase_label"].startswith("inconnu_"):
+            log.warning("Phase inconnue détectée : %s", payload["phase_label"])
+        changed = changed or LOG_MODE == "changes"
+        _status["phase"] = payload["phase_label"]
+    if payload["code_erreur"] != _status["err"]:
+        changed = changed or LOG_MODE == "changes"
+        _status["err"] = payload["code_erreur"]
+    if changed or now - _status["at"] >= STATUS_LOG_S:
+        log.info(line)
+        _status["at"] = now
+
+
+# ── Capture des trames (reverse engineering) ──────────────────────────────────
+class Capture:
+    """Écrit chaque CHANGEMENT de registre (et les capteurs GPIO) dans un CSV du jour, avec instantané complet toutes les 10 min."""
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.prev = None
+        self.snap_at = 0.0
+        self.fh = None
+        self.day = None
+        self.flush_at = 0.0
+        self.x_day = None
+        self.x_bytes = 0
+        self.lock = threading.Lock()
+        if enabled:
+            try:
+                os.makedirs(CAPTURE_DIR, exist_ok=True)
+                log.info("Capture activée -> %s (DOMUSA_CAPTURE=1)", CAPTURE_DIR)
+            except Exception as e:
+                log.warning("Capture impossible (%s) : désactivée", e)
+                self.enabled = False
+
+    def _file(self, now):
+        day = time.strftime("%Y%m%d", time.localtime(now))
+        if day != self.day:
+            if self.fh:
+                self.fh.close()
+            self.fh = open(os.path.join(CAPTURE_DIR, f"capture-{day}.csv"), "a", buffering=1 << 16)
+            self.day = day
+            cutoff = now - CAPTURE_KEEP_DAYS * 86400
+            for f in os.listdir(CAPTURE_DIR):
+                fp = os.path.join(CAPTURE_DIR, f)
+                if f.startswith("capture-") and os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)
+        return self.fh
+
+    def _ts(self, now):
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)) + ".%03d" % int((now % 1) * 1000)
+
+    def _maybe_flush(self, now):
+        if now - self.flush_at > 30 and self.fh:
+            self.fh.flush()
+            self.flush_at = now
+
+    def frame(self, regs, now):
+        if not self.enabled:
+            return
+        with self.lock:
+            try:
+                fh = self._file(now)
+                ts = self._ts(now)
+                if self.prev is None or now - self.snap_at >= 600:
+                    fh.write("%s,S,%s\n" % (ts, " ".join(str(v) for v in regs)))
+                    self.snap_at = now
+                else:
+                    for i, (a, b) in enumerate(zip(self.prev, regs)):
+                        if a != b:
+                            fh.write("%s,R,%d,%d,%d\n" % (ts, i, a, b))
+                self.prev = list(regs)
+                self._maybe_flush(now)
+            except Exception as e:
+                log.warning("Capture : %s", e)
+                self.enabled = False
+
+    def other(self, data, now):
+        """Octets du bus qui ne sont pas une trame 'écriture de 70 registres' (autres esclaves, lectures, réponses...)."""
+        if not self.enabled or not data:
+            return
+        with self.lock:
+            try:
+                fh = self._file(now)
+                if self.x_day != self.day:
+                    self.x_day, self.x_bytes = self.day, 0
+                if self.x_bytes > CAPTURE_X_MAX:
+                    return
+                self.x_bytes += len(data)
+                fh.write("%s,X,%s\n" % (self._ts(now), data.hex()))
+                self._maybe_flush(now)
+            except Exception as e:
+                log.warning("Capture : %s", e)
+                self.enabled = False
+
+    def gpio(self, name, value):
+        if not self.enabled:
+            return
+        now = time.time()
+        with self.lock:
+            try:
+                fh = self._file(now)
+                fh.write("%s,G,%s,%s\n" % (self._ts(now), name, value))
+                self._maybe_flush(now)
+            except Exception as e:
+                log.warning("Capture : %s", e)
+                self.enabled = False
+
+capture = Capture(CAPTURE)
 
 
 # ── Callbacks MQTT ────────────────────────────────────────────────────────────
+bus = {"online": False, "last_frame": 0.0}
+
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         log.info("Connecté au broker MQTT %s:%d", MQTT_BROKER, MQTT_PORT)
-        # Disponibilité
+        # Disponibilité (repart de zéro : tout est republié)
+        _avail_state.clear()
         client.publish(AVAIL_TOPIC, "online", qos=1, retain=True)
+        set_avail(client, AVAIL_BUS_TOPIC, bus["online"])
         # Abonnement au topic de naissance HA (réenvoi discovery si HA redémarre)
         client.subscribe(HA_STATUS, qos=1)
         log.info("Abonné à %s", HA_STATUS)
@@ -715,6 +937,27 @@ def on_message(client, userdata, msg):
         log.info("Home Assistant (re)démarré → re-publication de la découverte MQTT")
         client.publish(AVAIL_TOPIC, "online", qos=1, retain=True)
         publish_discovery(client)
+
+
+def drain_buffer(buffer, other):
+    """Extrait les trames valides (écriture 70 registres, esclave 3) ; les autres octets vont dans `other`.
+    Retourne (buffer restant, derniers registres ou None)."""
+    regs_out = None
+    while len(buffer) >= 9:
+        if buffer[0] == 3 and buffer[1] == 0x10:
+            byte_count = buffer[6]
+            frame_len  = 7 + byte_count + 2
+            if 9 <= frame_len < 200:
+                if len(buffer) < frame_len:
+                    break
+                regs = parse_frame(bytes(buffer[:frame_len]))
+                if regs is not None:
+                    regs_out = regs
+                    buffer   = buffer[frame_len:]
+                    continue
+        other.append(buffer[0])
+        buffer = buffer[1:]
+    return buffer, regs_out
 
 
 # ── Vérification des prérequis ────────────────────────────────────────────────
@@ -878,6 +1121,8 @@ def main():
 
     # ── Boucle principale ──────────────────────────────────────────────────────
     buffer       = bytearray()
+    other        = bytearray()
+    other_last   = 0.0
     last_regs    = None
     last_publish = 0.0
 
@@ -893,31 +1138,33 @@ def main():
             log.error("Erreur lecture série : %s", e)
             time.sleep(1)
 
-        # Parsing
-        updated = False
-        while len(buffer) >= 9:
-            if buffer[0] == 3 and buffer[1] == 0x10:
-                byte_count = buffer[6]
-                frame_len  = 7 + byte_count + 2
-                if frame_len >= 200 or frame_len < 9:
-                    buffer = buffer[1:]
-                    continue
-                if len(buffer) < frame_len:
-                    break
-                regs = parse_frame(bytes(buffer[:frame_len]))
-                if regs is not None:
-                    last_regs = regs
-                    buffer    = buffer[frame_len:]
-                    updated   = True
-                    continue
-            buffer = buffer[1:]
+        # Parsing (les octets non reconnus sont gardés pour la capture, lignes X)
+        n_other = len(other)
+        buffer, new_regs = drain_buffer(buffer, other)
+        updated = new_regs is not None
+        if updated:
+            last_regs = new_regs
+        if len(other) != n_other:
+            other_last = time.time()
+        if other and time.time() - other_last > 0.05:      # silence sur le bus : fin d'un paquet
+            capture.other(bytes(other), other_last)
+            other.clear()
 
-        # Publication MQTT
+        # Publication MQTT : uniquement sur trame fraîche (plus de republication de valeurs périmées)
         now = time.time()
-        if last_regs is not None:
-            if updated or (now - last_publish) >= PUBLISH_INTERVAL:
-                publish_all(client, last_regs)
-                last_publish = now
+        if updated and last_regs is not None:
+            bus["last_frame"] = now
+            if not bus["online"]:
+                bus["online"] = True
+                log.info("Trames Modbus reçues : entités chaudière disponibles")
+            set_avail(client, AVAIL_BUS_TOPIC, True)
+            publish_all(client, last_regs)
+            capture.frame(last_regs, now)
+            last_publish = now
+        elif bus["online"] and now - bus["last_frame"] > BUS_STALE_S:
+            bus["online"] = False
+            set_avail(client, AVAIL_BUS_TOPIC, False)
+            log.warning("Aucune trame Modbus depuis %d s -> entités chaudière indisponibles", BUS_STALE_S)
 
         time.sleep(0.05)
 
